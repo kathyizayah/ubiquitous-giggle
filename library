@@ -1,0 +1,115 @@
+pragma solidity ^0.8.0;
+import './token/ERC20/extensions/ERC20FlashMint.sol';
+import './utils/math/Math.sol';
+
+//Synthetic gastoken: use CDPs not refunds
+contract SyntheticGastoken is ERC20FlashMint{
+	using Math for uint256;
+	//How much Ethereum collateral the borrower have remaining
+	mapping(address => uint256) public collateralRemaining;
+	//How many Synthetic Gastokens the borrower still owe
+	mapping(address => uint256) public debtRemaining;
+	
+	//emitted when collateralized debt positions are liqidated
+	event Liquidated(address indexed debtor, uint256 indexed amount);
+	//emitted when collateral was added or removed
+	event CollateralAdded(address indexed borrower, uint256 indexed amount);
+	event CollateralRemoved(address indexed borrower, uint256 indexed amount);
+	
+	constructor() ERC20('Synthetic Gastoken', 'xGAS'){
+		
+	}
+	
+	//Add collateral
+	function addCollateral(address to) external payable{
+		uint256 temp = collateralRemaining[to] + msg.value;
+		require(temp >= 0.1 ether, 'SyntheticGastoken: minimum collateral is 0.1 eth');
+		collateralRemaining[to] = temp;
+		emit CollateralAdded(to, msg.value);
+	}
+	//Remove collateral
+	function removeCollateral(address payable to, uint256 value) external{
+		uint256 temp = collateralRemaining[msg.sender];
+		require(temp >= value, 'SyntheticGastoken: collateral withdrawal exceeds remaining collateral');
+		unchecked{
+			temp -= value;
+		}
+		require(temp >= 0.1 ether, 'SyntheticGastoken: minimum collateral is 0.1 eth');
+		collateralRemaining[msg.sender] = temp;
+		require(debtRemaining[msg.sender] <= debtLimit(msg.sender), 'SyntheticGastoken: excessive collateral withdrawal');
+		(bool success, ) = to.call{value: value}('');
+		require(success, 'SyntheticGastoken: unable to send ethereum');
+		emit CollateralRemoved(to, value);
+	}
+	//require 3x overcollateralization when minting synthetic Gastokens
+	function debtLimit(address debtor) public view returns (uint256){
+		return collateralRemaining[debtor] / block.basefee / 3;
+	}
+	//minimum 2x overcollateralization. Any lower than that and it's liquidation time!
+	function safeDebtLimit(address debtor) public view returns (uint256){
+		return collateralRemaining[debtor] / block.basefee / 2;
+	}
+	function liquidatableDebt(address debtor) public view returns (uint256){
+		uint256 currentDebt = debtRemaining[debtor];
+		uint256 maximumSafeDebt = safeDebtLimit(debtor);
+		if(currentDebt <= maximumSafeDebt){
+			return 0;
+		} else{
+			unchecked{
+				return currentDebt - maximumSafeDebt;
+			}
+		}
+	}
+	//Effective liquidation price
+	function effectiveLiquidationPrice(address debtor) public view returns (uint256){
+		uint256 temp = debtRemaining[debtor];
+		require(temp != 0, 'SyntheticGastoken: debtor has no debt');
+		//NOTE: liquidated collateral is sold at 1/3 discount, and can be lower if the position
+		//is severely undercollateralized
+		return Math.min(temp / collateralRemaining[debtor], (block.basefee / 3) * 2);
+	}
+	//Mints new synthetic gastokens when debt is taken out, similar to quantitative easing
+	function mint(address to, uint256 value) external{
+		uint256 temp = debtRemaining[msg.sender] + value;
+		require(temp <= debtLimit(msg.sender), 'SyntheticGastoken: debt limit exceeded');
+		debtRemaining[msg.sender] = temp;
+		_mint(to, value);
+	}
+	//Burns synthetic gastokens, and reduces outstanding debt
+	function repay(address to, uint256 value) external{
+		uint256 temp = debtRemaining[to];
+		require(temp >= value, 'SyntheticGastoken: repayment exceeds outstanding debt');
+		_burn(msg.sender, value);
+		unchecked{
+			debtRemaining[to] = temp - value;
+		}
+	}
+	//Burns synthetic gastokens, and reduces outstanding debt
+	//Also liquidates collateralized debt position
+	function liquidate(address debtor, address payable to, uint256 value) external{
+		uint256 temp = debtRemaining[debtor];
+		require(temp >= value, 'SyntheticGastoken: repayment exceeds outstanding debt');
+		require(value <= liquidatableDebt(debtor), 'SyntheticGastoken: liquidation exceeds liquidatable debt');
+		_burn(msg.sender, value);
+		temp -= value;
+		uint256 proceeds = effectiveLiquidationPrice(debtor) * value;
+		uint256 collateralRemaining2 = collateralRemaining[debtor];
+		if(proceeds > collateralRemaining2){
+			proceeds = collateralRemaining2;
+		}
+		unchecked{
+			collateralRemaining2 -= proceeds;
+		}
+		//Minimum collateral: 0.1 ether
+		if(collateralRemaining2 < 0.1 ether || temp == 0){
+			temp = 0;
+			proceeds += collateralRemaining2;
+			collateralRemaining2 = 0;
+		}
+		debtRemaining[debtor] = temp;
+		collateralRemaining[debtor] = collateralRemaining2;
+		(bool success, ) = to.call{value: proceeds}('');
+		require(success, 'SyntheticGastoken: unable to send ethereum');
+		emit Liquidated(debtor, proceeds);
+	}
+}
